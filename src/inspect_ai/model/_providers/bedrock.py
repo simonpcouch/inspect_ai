@@ -136,6 +136,7 @@ class ConverseMessageContent(BaseModel):
     toolResult: ConverseToolResult | None = None
     guardContent: ConverseGuardContent | None = None
     reasoningContent: ConverseReasoningContent | None = None
+    cachePoint: dict[str, str] | None = None
 
 
 class ConverseMessage(BaseModel):
@@ -151,6 +152,8 @@ class ConverseUsage(BaseModel):
     inputTokens: int
     outputTokens: int
     totalTokens: int
+    cacheReadInputTokens: int | None = None
+    cacheWriteInputTokens: int | None = None
 
 
 class ConverseMetrics(BaseModel):
@@ -195,6 +198,7 @@ class ConverseContent(BaseModel):
 class ConverseSystemContent(BaseModel):
     text: str | None = None
     guardContent: ConverseGuardContent | None = None
+    cachePoint: dict[str, str] | None = None
 
 
 class ConverseInferenceConfig(BaseModel):
@@ -213,7 +217,8 @@ class ConverseToolSpec(BaseModel):
 
 
 class ConverseTool(BaseModel):
-    toolSpec: ConverseToolSpec
+    toolSpec: ConverseToolSpec | None = None
+    cachePoint: dict[str, str] | None = None
 
 
 class ConverseToolChoice(BaseModel):
@@ -458,6 +463,13 @@ class BedrockAPI(ModelAPI):
                 input, emulate_reasoning=self.is_claude()
             )
 
+            # Insert cache breakpoints for prompt caching
+            cache_prompt = config.cache_prompt
+            if cache_prompt is None or cache_prompt == "auto":
+                cache_prompt = True
+            if cache_prompt and self.is_claude():
+                _add_bedrock_cache_points(system, resolved_tools, messages)
+
             # additional model request fields
             additionalModelRequestFields: dict[str, Any] = {}
             if config.top_k:
@@ -619,7 +631,11 @@ def model_output_from_response(
     # Compute usage
     input_tokens = response.usage.inputTokens
     output_tokens = response.usage.outputTokens
-    total_tokens = input_tokens + output_tokens
+    cache_read = response.usage.cacheReadInputTokens
+    cache_write = response.usage.cacheWriteInputTokens
+    total_tokens = (
+        input_tokens + (cache_read or 0) + (cache_write or 0) + output_tokens
+    )
 
     # return ModelOutput
     return ModelOutput(
@@ -629,6 +645,8 @@ def model_output_from_response(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             total_tokens=total_tokens,
+            input_tokens_cache_read=cache_read,
+            input_tokens_cache_write=cache_write,
         ),
     )
 
@@ -669,6 +687,40 @@ def as_converse_system_messages(
     return [
         ConverseSystemContent(text=message.text) for message in messages if message.text
     ]
+
+
+_CACHE_POINT_BLOCK = ConverseMessageContent(cachePoint={"type": "default"})
+_CACHE_POINT_SYSTEM = ConverseSystemContent(cachePoint={"type": "default"})
+
+
+def _add_bedrock_cache_points(
+    system: list[ConverseSystemContent] | None,
+    tools: list[ConverseTool] | None,
+    messages: list[ConverseMessage],
+) -> None:
+    """Insert cachePoint markers for Bedrock Converse prompt caching.
+
+    Bedrock uses cachePoint as a separate union member (not a field on
+    existing blocks). A cachePoint block is inserted *after* the content
+    that should be cached.
+
+    Mirrors the Anthropic provider's breakpoint strategy:
+    1. After the last system block
+    2. After the last tool definition
+    3. After the second-to-last content block of the last message
+    """
+    if system:
+        system.append(_CACHE_POINT_SYSTEM)
+    if tools:
+        tools.append(ConverseTool(toolSpec=None, cachePoint={"type": "default"}))
+    if messages:
+        last_content = messages[-1].content
+        if len(last_content) >= 2:
+            last_content.insert(-1, _CACHE_POINT_BLOCK)
+        elif len(messages) >= 2:
+            prev_content = messages[-2].content
+            if prev_content:
+                prev_content.append(_CACHE_POINT_BLOCK)
 
 
 async def as_converse_chat_messages(
