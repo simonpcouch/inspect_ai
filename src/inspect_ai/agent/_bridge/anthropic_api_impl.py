@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import io
+import weakref
 from logging import getLogger
 from os import PathLike
 from typing import IO, Any, Literal, cast
@@ -28,7 +29,13 @@ from anthropic.types.beta import (
 )
 from shortuuid import uuid
 
-from inspect_ai._util.content import Content, ContentDocument, ContentImage, ContentText
+from inspect_ai._util.content import (
+    Content,
+    ContentDocument,
+    ContentImage,
+    ContentReasoning,
+    ContentText,
+)
 from inspect_ai._util.images import as_data_uri
 from inspect_ai.model._chat_message import (
     ChatMessage,
@@ -124,6 +131,9 @@ async def inspect_anthropic_api_request_impl(
     debug_log("SCAFFOLD INPUT", input)
 
     messages = await messages_from_anthropic_input(input, tools)
+    # Re-attach reasoning/function-call signatures the scaffold can't carry (see
+    # _restore_gemini_tool_signatures).
+    _restore_gemini_tool_signatures(bridge, messages)
     debug_log("INSPECT MESSAGES", messages)
 
     # extract generate config (hoist instructions into system_message)
@@ -147,6 +157,10 @@ async def inspect_anthropic_api_request_impl(
         messages.append(c_message)
 
     debug_log("INSPECT OUTPUT", output.message)
+
+    # remember any reasoning/function-call signatures on this turn's output so we
+    # can re-attach them when the scaffold replays the turn (see below).
+    _remember_gemini_tool_signatures(bridge, output.message)
 
     # update state if we have more messages than the last generation
     bridge._track_state(messages, output)
@@ -325,6 +339,76 @@ def tool_choice_from_anthropic_tool_choice(
             return "none"
         case "tool":
             return ToolFunction(name=tool_choice["name"])
+
+
+# Some backends (notably Gemini 3) attach an opaque signature to each
+# function_call and REQUIRE it echoed back on every subsequent turn, or they
+# reject the resent call. Inspect carries it in a redacted ContentReasoning's
+# `reasoning`, anchored to the call via internal[_GEMINI_FUNCTION_CALL_ID_KEY].
+# The Anthropic bridge dialect has no block that survives a round-trip through an
+# external scaffold for this (scaffolds keep text + tool_use but drop thinking /
+# redacted_thinking blocks), so the signature would be lost and multi-turn tool
+# use would break. Instead we keep it bridge-side, keyed by tool_call id, and
+# re-attach it whenever the scaffold replays that call. The store is per-bridge
+# (one bridge per sample), so it's isolated across concurrent samples/epochs.
+_GEMINI_FUNCTION_CALL_ID_KEY = "gemini_function_call_id"
+_gemini_tool_signatures: "weakref.WeakKeyDictionary[AgentBridge, dict[str, str]]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _remember_gemini_tool_signatures(
+    bridge: AgentBridge, message: ChatMessageAssistant
+) -> None:
+    # Capture every anchor, signed OR not. Parallel calls anchor the signed call
+    # with its signature and the unsigned siblings with an empty-string anchor
+    # that pins their original position; dropping the empties would let replay
+    # reorder an unsigned sibling and trigger a "missing thought_signature" 400.
+    if not isinstance(message.content, list):
+        return
+    for content in message.content:
+        if (
+            isinstance(content, ContentReasoning)
+            and content.redacted
+            and isinstance(content.internal, dict)
+        ):
+            call_id = content.internal.get(_GEMINI_FUNCTION_CALL_ID_KEY)
+            if isinstance(call_id, str):
+                store = _gemini_tool_signatures.setdefault(bridge, {})
+                store[call_id] = content.reasoning or ""
+
+
+def _restore_gemini_tool_signatures(
+    bridge: AgentBridge, messages: list[ChatMessage]
+) -> None:
+    store = _gemini_tool_signatures.get(bridge)
+    if not store:
+        return
+    for message in messages:
+        if not isinstance(message, ChatMessageAssistant) or not message.tool_calls:
+            continue
+        content = (
+            list(message.content)
+            if isinstance(message.content, list)
+            else ([ContentText(text=message.content)] if message.content else [])
+        )
+        # don't double-anchor a call that already carries its signature
+        anchored = {
+            c.internal.get(_GEMINI_FUNCTION_CALL_ID_KEY)
+            for c in content
+            if isinstance(c, ContentReasoning) and isinstance(c.internal, dict)
+        }
+        anchors = [
+            ContentReasoning(
+                reasoning=store[tc.id],
+                redacted=True,
+                internal={_GEMINI_FUNCTION_CALL_ID_KEY: tc.id},
+            )
+            for tc in message.tool_calls
+            if tc.id in store and tc.id not in anchored
+        ]
+        if anchors:
+            message.content = anchors + content
 
 
 async def messages_from_anthropic_input(
