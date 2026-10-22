@@ -53,7 +53,7 @@ from inspect_ai.model._generate_config import (
     ResponseSchema,
 )
 from inspect_ai.model._internal import CONTENT_INTERNAL_TAG, parse_content_with_internal
-from inspect_ai.model._model import ModelName
+from inspect_ai.model._model import Model, ModelName
 from inspect_ai.model._model_output import ModelUsage, StopReason
 from inspect_ai.model._providers._anthropic_citations import to_inspect_citation
 from inspect_ai.model._providers.anthropic import (
@@ -212,7 +212,9 @@ async def inspect_anthropic_api_request_impl(
     message_class = BetaMessage if beta else Message
     message = message_class.model_construct(
         id=output.message.id or uuid(),
-        content=await assistant_message_blocks(output.message, beta=beta),
+        content=await assistant_message_blocks(
+            _without_textual_reasoning(model, output.message), beta=beta
+        ),
         model=output.model,
         role="assistant",
         stop_reason=anthropic_stop_reason(output.stop_reason),
@@ -518,6 +520,31 @@ _GEMINI_FUNCTION_CALL_ID_KEY = "gemini_function_call_id"
 _gemini_tool_signatures: "weakref.WeakKeyDictionary[AgentBridge, dict[str, str]]" = (
     weakref.WeakKeyDictionary()
 )
+
+
+def _without_textual_reasoning(
+    model: Model, message: ChatMessageAssistant
+) -> ChatMessageAssistant:
+    """Drop reasoning that the Anthropic dialect could only render as text.
+
+    Reasoning from a non-Anthropic model has no Anthropic signature, so
+    `assistant_message_blocks` would emit it as a `<think>` text block. The
+    scaffold would then treat the model's private reasoning as reply text, show
+    it as such, and replay it as text. Gemini function-call signatures survive
+    regardless (see `_restore_gemini_tool_signatures`).
+    """
+    if ModelName(model).api == "anthropic" or not isinstance(message.content, list):
+        return message
+    content = [
+        c
+        for c in message.content
+        if not (
+            isinstance(c, ContentReasoning)
+            and c.summary is None
+            and not (c.redacted and c.signature is not None)
+        )
+    ]
+    return message.model_copy(update={"content": content})
 
 
 def _dedupe_gemini_tool_call_ids(
