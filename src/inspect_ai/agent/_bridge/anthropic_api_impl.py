@@ -202,6 +202,7 @@ async def inspect_anthropic_api_request_impl(
 
     # remember any reasoning/function-call signatures on this turn's output so we
     # can re-attach them when the scaffold replays the turn (see below).
+    _dedupe_gemini_tool_call_ids(bridge, output.message)
     _remember_gemini_tool_signatures(bridge, output.message)
 
     # update state if we have more messages than the last generation
@@ -517,6 +518,31 @@ _GEMINI_FUNCTION_CALL_ID_KEY = "gemini_function_call_id"
 _gemini_tool_signatures: "weakref.WeakKeyDictionary[AgentBridge, dict[str, str]]" = (
     weakref.WeakKeyDictionary()
 )
+
+
+def _dedupe_gemini_tool_call_ids(
+    bridge: AgentBridge, message: ChatMessageAssistant
+) -> None:
+    # Gemini's short call ids (e.g. `call_101263`) can repeat within a sample, and
+    # a scaffold that renames the repeat replays it without its stored signature.
+    # Gemini accepts any id on replay, so give repeats a fresh one up front.
+    store = _gemini_tool_signatures.get(bridge)
+    if not store or not message.tool_calls:
+        return
+    renamed: dict[str, str] = {}
+    for tool_call in message.tool_calls:
+        if tool_call.id in store:
+            renamed[tool_call.id] = tool_call.id = f"{tool_call.id}-{uuid()}"
+    if not renamed or not isinstance(message.content, list):
+        return
+    for content in message.content:
+        if isinstance(content, ContentReasoning) and isinstance(content.internal, dict):
+            call_id = content.internal.get(_GEMINI_FUNCTION_CALL_ID_KEY)
+            if call_id in renamed:
+                content.internal = {
+                    **content.internal,
+                    _GEMINI_FUNCTION_CALL_ID_KEY: renamed[call_id],
+                }
 
 
 def _remember_gemini_tool_signatures(
